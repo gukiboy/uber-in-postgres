@@ -1,0 +1,346 @@
+#+title: Uber using only Postgres
+
+* Introduction
+
+This link
+https://www.linkedin.com/pulse/how-many-tps-can-we-get-from-single-postgres-node-nikolay-samokhvalov-yu0rc/
+claims to have achieved 4M tps in a single Postgres node.
+
+It is said that Amazon can get up to 150k tps.
+
+The test done in the link is only using SELECTs.
+
+This experiment will attempt to create the backend of a popular
+application only in Postgres, and optimize it as much as possible
+while trying to simulate realistic scenarios using pgbench.
+
+Let's see how many tps we can get to.
+
+* Modeling
+
+#+begin_src plantuml :file model.png
+entity pg_user {
+usename : TEXT
+}
+
+entity pg_roles {
+rolname : TEXT
+}
+
+entity ride {
+id : NUMBER
+--
+driver: pg_user
+customer: pg_user
+start_location: LOCATION
+destination: LOCATION
+time : TIMESTAMPTZ
+start_time: TIMESTAMPTZ
+end_time: TIMESTAMPTZ
+cost : NUMBER
+}
+
+entity ride_request {
+driver: pg_user
+customer :pg_user
+time: TIMESTAMPTZ
+}
+
+entity driver_location {
+driver : pg_user
+--
+location : LOCATION
+}
+
+entity ride_location {
+id : NUMBER
+--
+current_location: LOCATION
+}
+
+pg_user::usename --> ride::customer
+pg_user::usename --> ride::driver
+ride::id --> ride_location::id
+pg_user::usename --> driver_location::driver
+pg_user::usename --> ride_request::driver
+pg_user::usename --> ride_request::customer
+#+end_src
+
+#+RESULTS:
+[[file:model.png]]
+
+* Database
+:PROPERTIES:
+:header-args:sql:  :engine postgres  :dbuser postgres
+:header-args:sql+: :dbhost localhost :database postgres :dbpassword example
+:END:
+
+** Database
+
+Let's first create our database. Let's call our application RIDER.
+
+#+begin_src sql
+	CREATE DATABASE RIDER;
+#+end_src
+
+#+RESULTS:
+| CREATE DATABASE |
+|-----------------|
+
+#+begin_src sql
+\c rider
+#+end_src
+
+#+RESULTS:
+|---|
+
+** Users
+
+We're going to use Postgres role management system for both customer
+and drivers.
+
+A PG role can be both an user and a group. In our case, we'll have two
+*groups*, *driver* and *customer*. Users can be one or both.
+
+*** Customer/clients
+
+
+#+begin_src sql :database rider
+CREATE ROLE customer NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+#+end_src
+
+#+RESULTS:
+| CREATE ROLE |
+|-------------|
+
+
+- Create a customer
+
+#+begin_src sql :database rider
+	CREATE USER gustavokishima IN ROLE customer;
+#+end_src
+
+#+begin_src sql :database rider :dbuser gustavokishima :dbpassword 123
+\du
+#+end_src
+
+#+RESULTS:
+| usename        | usesysid | usecreatedb | usesuper | userepl | usebypassrls | passwd   | valuntil | useconfig |
+|----------------+----------+-------------+----------+---------+--------------+----------+----------+-----------|
+| postgres       |       10 | t           | t        | t       | t            | ******** |          |           |
+| gustavokishima |    16390 | f           | f        | f       | f            | ******** |          |           |
+
+
+** Roles and users
+
+We can't use *pg_roles* as a reference to a table, because it is a
+view. The table that *pg_roles* is derived from is *pg_authid*,
+however, this is a *pg_catalog* table, which cannot be referenced.
+
+To circumvent that, we will use a trigger and table.
+
+
+- *Table for all customers*
+
+  We need to create a table for that first due to SQL limitations. The
+  query below does that, and gives us only the customers.
+
+  #+begin_src sql :database rider
+  DROP TABLE customers;
+  CREATE TABLE customers AS
+  SELECT r.rolname AS username
+  FROM   pg_catalog.pg_roles r
+	 LEFT JOIN pg_catalog.pg_auth_members m
+		ON ( m.member = r.oid )
+	 LEFT JOIN pg_roles r1
+		ON ( m.roleid = r1.oid )
+  WHERE  r.rolcanlogin
+	 AND r1.rolname = 'customer'
+  ORDER  BY 1; 
+  #+end_src
+
+  #+RESULTS:
+  | DROP TABLE |
+  |------------|
+  | SELECT 3   |
+
+#+begin_src sql :database rider
+	select * from customers;
+#+end_src
+
+#+RESULTS:
+| username       |
+|----------------|
+| gustavokishima |
+| ricardokishima |
+| tamireslemos   |
+
+  But also, we need a way to update that. This can be done with a trigger.
+  - *WIP*
+    #+begin_src sql :database rider
+	    -- WIP How can this update the `customers` table that was created?
+    CREATE OR REPLACE FUNCTION upsert_customer_from_pg_roles()
+    RETURNS trigger AS $upsert_customer$
+    BEGIN
+    INSERT INTO customers (username)
+	   VALUES         (new.rolname)
+    RETURN NEW;
+    END;
+    $upsert_customer$
+
+    CREATE OR REPLACE TRIGGER update_customer
+     AFTER INSERT ON pg_roles
+     FOR EACH ROW
+     WHEN (pg_catalog.pg_roles r
+	   LEFT JOIN pg_catalog.pg_auth_members m
+		  ON ( m.member = r.oid )
+	   LEFT JOIN pg_roles r1
+		  ON ( m.roleid = r1.oid )
+    WHERE  r.rolcanlogin
+	   AND r1.rolname = 'customer')
+  #+end_src
+
+
+  #+begin_src sql :database rider
+    SELECT r.rolname AS username
+    FROM   pg_catalog.pg_roles r
+	   LEFT JOIN pg_catalog.pg_auth_members m
+		  ON ( m.member = r.oid )
+	   LEFT JOIN pg_roles r1
+		  ON ( m.roleid = r1.oid )
+    WHERE  r.rolcanlogin
+	   AND r1.rolname = 'customer';
+  #+end_src
+
+  #+RESULTS:
+  | username       |
+  |----------------|
+  | gustavokishima |
+  | ricardokishima |
+  | tamireslemos   |
+
+
+** Ride
+We will use the Postgis extension for location related stuff, so we
+have to install it.
+
+#+begin_src sql :database rider
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+CREATE TABLE RIDE (
+       id bigint      generated always as identity,
+       customer       pg_user references pg_authid (rolname),
+       driver         pg_user references pg_authid (rolname),
+       start_location geography(Point),
+       destination    geography(Point),
+       ts             timestamptz,
+       start_time     timestamptz,
+       end_time       timestamptz,
+       cost           numeric
+       );
+#+end_src
+
+#+RESULTS:
+| CREATE EXTENSION |
+|------------------|
+
+* Diary :noexport:
+
+- *Tue Nov 12 23:27:21 -03 2024*
+
+  We still need a way to identify the ride phases:
+
+  1. Looking for drivers
+  2. Driver going to start location
+  3. driver going to destination
+
+  - We have a good way to calculate distance:
+    https://postgis.net/workshops/postgis-intro/geography.html
+
+- *Wed Nov 27 12:37:32 -03 2024*
+
+  The main thing of our model is the *ride*, on which a *customer*,
+  defined by having the *customer* role in *pg_users* will be given a
+  ride by a *driver*.
+
+  Drivers need to be filtered out by *location* and *status*. Location
+  because we can't give a ride to someone that is too far away from
+  us. Status because a driver that is giving a ride at the moment
+  can't give a ride to someone else unless it finishes.
+
+  We might not need a state machine for that, we can just use the
+  current state of the database, we could just use queries, like,
+  querying both driver location and ride table to see if a driver is
+  available.
+
+  Start the db like this btw:
+
+  #+begin_src shell
+  docker-compose up
+  #+end_src
+
+- *Thu Nov 28 16:58:22 -03 2024*
+
+  I'm having some issues. I still can't create a database and connect
+  to it for some reason, I wonder if I have psql version
+  problems. Other than that, I could create a role, which was easy,
+  and I assume I can create a customer with ease as well.
+
+  I'm using the pg_users for that, along with the pg_roles. My plan is
+  to provide RLS with Postgres only. Of course, a real application
+  would require more information, like IDs, but I will not add that,
+  as it is somewhat trivial.
+
+  I also would like a way to create many different kinds of data,
+  like, inserting different users, but I still don't have that.
+
+- *Fri Nov 29 15:34:09 -03 2024*
+
+  NOTE: When using org mode with sql, you can just add a :database tag
+  to the source block that it will automatically run the query in that
+  database. Pretty cool
+
+- *Fri Nov 29 16:39:08 -03 2024*
+
+  - Users and what they should do
+
+    Users will have different privileges based on what they should do
+    and access. Let's discuss them a little bit:
+
+    - Customer
+
+      A customer will ask for rides. To be able to do that, he must
+      know about close drivers, which is granted by the
+      *driver_location* table. However, this is not enough, since the
+      driver must also be available for a ride. To do this, we should
+      look either at another table called *driver_status* or we could
+      derive it from drivers that are not in rides at the
+      moment. Beyond that, the customer should only know about drivers
+      that are at a specific range of distance from them, so, driver
+      location comes into place once more. As most of that is derived,
+      the customer should have access to a *view*, that will need the
+      following information:
+
+      - driver location
+      - driver status
+      - customer location
+
+      This will give us available drivers for that customer. With
+      that, we should generate inputs for another table, that will
+      work as a form of...
+
+- *Fri Nov 29 17:19:52 -03 2024*
+
+  RESTARTING DISCUSSION
+
+  I think a better way to show availability is to use the driver
+  location table and add a "status" on it, indexing the table by
+  "status" and "location", so, when a ride request happen, the user
+  will only look into *driver_location_status*.
+
+  This must still generate the *ride_request* tuple, because we will
+  give the option to a *driver* to accept it or not.
+
+  The acceptance of the ride will then generate a tuple on the *ride*
+  table.
+
