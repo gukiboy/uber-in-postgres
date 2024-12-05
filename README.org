@@ -137,87 +137,71 @@ We can't use *pg_roles* as a reference to a table, because it is a
 view. The table that *pg_roles* is derived from is *pg_authid*,
 however, this is a *pg_catalog* table, which cannot be referenced.
 
-To circumvent that, we will use a trigger and table.
+We'll employ some tricks to circumvent this:
 
+*** All users table
 
-- *Table for all customers*
-
-  We need to create a table for that first due to SQL limitations. The
-  query below does that, and gives us only the customers.
-
-  #+begin_src sql :database rider
-  DROP TABLE customers;
-  CREATE TABLE customers AS
-  SELECT r.rolname AS username
-  FROM   pg_catalog.pg_roles r
-	 LEFT JOIN pg_catalog.pg_auth_members m
-		ON ( m.member = r.oid )
-	 LEFT JOIN pg_roles r1
-		ON ( m.roleid = r1.oid )
-  WHERE  r.rolcanlogin
-	 AND r1.rolname = 'customer'
-  ORDER  BY 1; 
-  #+end_src
-
-  #+RESULTS:
-  | DROP TABLE |
-  |------------|
-  | SELECT 3   |
-
+This table will have all of the users.
 #+begin_src sql :database rider
-	select * from customers;
+CREATE TABLE users (
+       username text PRIMARY KEY);
 #+end_src
 
 #+RESULTS:
-| username       |
-|----------------|
-| gustavokishima |
-| ricardokishima |
-| tamireslemos   |
+| CREATE TABLE |
+|--------------|
 
-  But also, we need a way to update that. This can be done with a trigger.
-  - *WIP*
-    #+begin_src sql :database rider
-	    -- WIP How can this update the `customers` table that was created?
-    CREATE OR REPLACE FUNCTION upsert_customer_from_pg_roles()
-    RETURNS trigger AS $upsert_customer$
-    BEGIN
-    INSERT INTO customers (username)
-	   VALUES         (new.rolname)
-    RETURN NEW;
-    END;
-    $upsert_customer$
+And yeah, that's all we will use. But, in order to create users as
+Postgres users, we will only use an UDF to create the users:
 
-    CREATE OR REPLACE TRIGGER update_customer
-     AFTER INSERT ON pg_roles
-     FOR EACH ROW
-     WHEN (pg_catalog.pg_roles r
-	   LEFT JOIN pg_catalog.pg_auth_members m
-		  ON ( m.member = r.oid )
-	   LEFT JOIN pg_roles r1
-		  ON ( m.roleid = r1.oid )
-    WHERE  r.rolcanlogin
-	   AND r1.rolname = 'customer')
-  #+end_src
+#+begin_src sql :database rider
+DROP  FUNCTION create_user(text,text,text);
+CREATE FUNCTION create_user(p_username text, password text, roles text)
+       RETURNS VOID AS
+       $$
+       BEGIN
+         INSERT INTO users (username) values (p_username);
+         EXECUTE FORMAT('CREATE USER %I PASSWORD %L IN GROUP %I', p_username, password, roles);
+       END
+       $$
+       LANGUAGE 'plpgsql';
+       
+#+end_src
 
+#+RESULTS:
+| DROP FUNCTION   |
+|-----------------|
+| CREATE FUNCTION |
 
-  #+begin_src sql :database rider
-    SELECT r.rolname AS username
-    FROM   pg_catalog.pg_roles r
-	   LEFT JOIN pg_catalog.pg_auth_members m
-		  ON ( m.member = r.oid )
-	   LEFT JOIN pg_roles r1
-		  ON ( m.roleid = r1.oid )
-    WHERE  r.rolcanlogin
-	   AND r1.rolname = 'customer';
-  #+end_src
+As we can see, it works:
 
-  #+RESULTS:
-  | username       |
-  |----------------|
-  | gustavokishima |
-  | ricardokishima |
-  | tamireslemos   |
+#+begin_src sql :database rider
+select create_user('neidekishima', '123', 'customer');
+#+end_src
+
+#+begin_src sql :database rider
+select * from users;
+#+end_src
+
+#+RESULTS:
+| username    |
+|-------------|
+| valdirakira |
+
+#+begin_src sql :database rider
+	\du;
+#+end_src
+
+#+RESULTS:
+| List of roles  |                                                            |            |
+|----------------+------------------------------------------------------------+------------|
+| Role name      | Attributes                                                 | Member of  |
+| customer       | Cannot login                                               | {}         |
+| gustavokishima |                                                            | {customer} |
+| postgres       | Superuser, Create role, Create DB, Replication, Bypass RLS | {}         |
+| ricardokishima |                                                            | {customer} |
+| tamireslemos   |                                                            | {customer} |
+| valdirakira    |                                                            | {customer} |
 
 
 ** Ride
@@ -229,8 +213,8 @@ CREATE EXTENSION IF NOT EXISTS postgis;
 
 CREATE TABLE RIDE (
        id bigint      generated always as identity,
-       customer       pg_user references pg_authid (rolname),
-       driver         pg_user references pg_authid (rolname),
+       customer       text    references users,
+       driver         text    references users,
        start_location geography(Point),
        destination    geography(Point),
        ts             timestamptz,
@@ -243,6 +227,7 @@ CREATE TABLE RIDE (
 #+RESULTS:
 | CREATE EXTENSION |
 |------------------|
+| CREATE TABLE     |
 
 * Diary :noexport:
 
@@ -344,3 +329,29 @@ CREATE TABLE RIDE (
   The acceptance of the ride will then generate a tuple on the *ride*
   table.
 
+- *Mon Dec  2 15:23:04 -03 2024*
+
+  Some stuff I discovered:
+
+  - I can't reference a system table
+  - I can't reference views
+
+  Some suggestions:
+
+  - Create a table that is updated from pg_roles hook. This is from
+    this idea that Bellani sent me:
+    https://supabase.com/blog/roles-postgres-hooks
+
+    This is not bad, but if I'm honest, it's a bit more than what I
+    wanted to do.
+
+  - Create a table that will be the "users" table and use it has the
+    source of truth, so, creating a new user should be done with an
+    UDF.
+
+    I like this one, that's what I'll use.
+
+- *Wed Dec  4 21:04:41 -03 2024*
+
+  I was able to make the function work! Although not if I pass two
+  groups.
