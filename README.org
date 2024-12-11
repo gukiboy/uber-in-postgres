@@ -23,8 +23,8 @@ entity pg_user {
 usename : TEXT
 }
 
-entity pg_roles {
-rolname : TEXT
+entity users {
+username : TEXT
 }
 
 entity ride {
@@ -32,38 +32,38 @@ id : NUMBER
 --
 driver: pg_user
 customer: pg_user
-start_location: LOCATION
-destination: LOCATION
+start_location: geography(Point)
+destination: geography(Point)
 time : TIMESTAMPTZ
 start_time: TIMESTAMPTZ
 end_time: TIMESTAMPTZ
-cost : NUMBER
+cost : NUMERIC
 }
 
 entity ride_request {
-driver: pg_user
-customer :pg_user
+driver : pg_user
+customer_location : geography(Point)
 time: TIMESTAMPTZ
 }
 
 entity driver_location {
 driver : pg_user
 --
-location : LOCATION
+location : geography(Point)
 }
 
 entity ride_location {
 id : NUMBER
 --
-current_location: LOCATION
+current_location: geography(Point)
 }
 
-pg_user::usename --> ride::customer
-pg_user::usename --> ride::driver
+pg_user::usename --> users::username
+users::username --> ride::customer
+users::username --> ride::driver
 ride::id --> ride_location::id
-pg_user::usename --> driver_location::driver
-pg_user::usename --> ride_request::driver
-pg_user::usename --> ride_request::customer
+users::username --> driver_location::driver
+users::username --> ride_request::driver
 #+end_src
 
 #+RESULTS:
@@ -229,6 +229,52 @@ CREATE TABLE RIDE (
 |------------------|
 | CREATE TABLE     |
 
+*** Lifecycle of a ride
+This is good enough to describe a ride. But now, we must think about
+how this happens in real life:
+
+- A customer want a ride. This is something that should happen in a
+  reasonable amount of time, so we need to find a driver that is close
+  to that person. *Because of that, we need to always know the driver
+  location*.
+
+- The driver can *deny* a ride, so, *we must keep ride requests saved
+  until someone accepts it*. _We don't need to worry about concurrency_
+  _in this scenario because Postgres guarantees ACID_. [TODO]
+
+** Driver location
+In order to find out the best driver to a given customer, we must
+always keep track of the driver location.
+
+#+begin_src sql :database rider
+CREATE TABLE DRIVER_LOCATION (
+       driver text references users PRIMARY KEY,
+       current_location geography(Point),
+       ts timestamptz
+       );
+#+end_src
+
+
+** Ride requests
+We must store ride requests,
+
+#+begin_src sql :database rider
+CREATE TABLE RIDE_REQUEST (
+       customer          text references users PRIMARY KEY,
+       customer_location geography(Point),
+       ts                timestamptz
+       );
+#+end_src
+
+** Creating new rides
+
+#+begin_src sql :database rider
+CREATE FUNCTION create_ride(text, text, geography(Point), geography(Point), timestamptz, timestamptz, timestamptz);
+	
+#+end_src
+
+
+
 * Diary :noexport:
 
 - *Tue Nov 12 23:27:21 -03 2024*
@@ -239,9 +285,8 @@ CREATE TABLE RIDE (
   2. Driver going to start location
   3. driver going to destination
 
-  - We have a good way to calculate distance:
-    https://postgis.net/workshops/postgis-intro/geography.html
-
+  4. We have a good way to calculate distance:
+     https://postgis.net/workshops/postgis-intro/geography.html
 - *Wed Nov 27 12:37:32 -03 2024*
 
   The main thing of our model is the *ride*, on which a *customer*,
@@ -263,7 +308,6 @@ CREATE TABLE RIDE (
   #+begin_src shell
   docker-compose up
   #+end_src
-
 - *Thu Nov 28 16:58:22 -03 2024*
 
   I'm having some issues. I still can't create a database and connect
@@ -278,13 +322,11 @@ CREATE TABLE RIDE (
 
   I also would like a way to create many different kinds of data,
   like, inserting different users, but I still don't have that.
-
 - *Fri Nov 29 15:34:09 -03 2024*
 
   NOTE: When using org mode with sql, you can just add a :database tag
   to the source block that it will automatically run the query in that
   database. Pretty cool
-
 - *Fri Nov 29 16:39:08 -03 2024*
 
   - Users and what they should do
@@ -313,7 +355,6 @@ CREATE TABLE RIDE (
       This will give us available drivers for that customer. With
       that, we should generate inputs for another table, that will
       work as a form of...
-
 - *Fri Nov 29 17:19:52 -03 2024*
 
   RESTARTING DISCUSSION
@@ -328,7 +369,6 @@ CREATE TABLE RIDE (
 
   The acceptance of the ride will then generate a tuple on the *ride*
   table.
-
 - *Mon Dec  2 15:23:04 -03 2024*
 
   Some stuff I discovered:
@@ -350,8 +390,46 @@ CREATE TABLE RIDE (
     UDF.
 
     I like this one, that's what I'll use.
-
 - *Wed Dec  4 21:04:41 -03 2024*
 
   I was able to make the function work! Although not if I pass two
   groups.
+- *Tue Dec 10 16:48:48 -03 2024*
+  
+  Now, I want to be able to insert new *rides*. Let's do this through a function.
+- *Wed Dec 11 13:49:21 -03 2024*
+
+  It would be good if I could create constraints based on the pg_user
+  table, but it might be unnecessary since I'll be the one doing the
+  insertion.
+
+  (NB. I'll do something silly for now: giving a ride will always be
+  going from A to B (grabbing customer) and from B to C (delivering
+  customer), with A->B and B->C being straight lines. If I'm able to
+  make it quick, I'll try to imitate stuff with location.)
+
+  A *RIDE* is something with phases, so, let's think about this:
+
+  - happy path
+    - customer requests ride (insert in ride_request)
+    - driver accepts ride (remove from ride_request, insert in ride
+      *without end_time*)
+      - If a driver *has a ride without and end_time, it means he is
+        giving a ride*.
+      - driver goes to ride location
+      - driver goes to destination
+  - driver finishes ride (adds *end_time* to ride.end_time)
+- refuse ride path
+  - customer requests ride (insert in ride_request)
+  - Denying means nothing happens, the requests just hangs there at
+    ride_request
+
+- *UP NEXT*
+
+  With most tables set up, we can start giving rides.
+
+  - *TODO* Create a function to request a ride (insert in ride_request)
+  - *TODO* " set up driver_location
+  - *TODO* " start a ride (insert in ride without ride.end_time)
+  - *TODO* " finish ride  (update existing ride with ride.end_time)
+
