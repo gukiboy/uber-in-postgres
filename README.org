@@ -130,7 +130,6 @@ CREATE ROLE customer NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 | postgres       |       10 | t           | t        | t       | t            | ******** |          |           |
 | gustavokishima |    16390 | f           | f        | f       | f            | ******** |          |           |
 
-
 ** Roles and users
 
 We can't use *pg_roles* as a reference to a table, because it is a
@@ -203,7 +202,6 @@ select * from users;
 | tamireslemos   |                                                            | {customer} |
 | valdirakira    |                                                            | {customer} |
 
-
 ** Ride
 We will use the Postgis extension for location related stuff, so we
 have to install it.
@@ -254,7 +252,6 @@ CREATE TABLE DRIVER_LOCATION (
        );
 #+end_src
 
-
 ** Ride requests
 We must store ride requests,
 
@@ -268,12 +265,57 @@ CREATE TABLE RIDE_REQUEST (
 
 ** Creating new rides
 
+To make our life easier, let's create a function for new riders.
+
 #+begin_src sql :database rider
-CREATE FUNCTION create_ride(text, text, geography(Point), geography(Point), timestamptz, timestamptz, timestamptz);
+CREATE OR REPLACE FUNCTION create_ride(customer text, driver text, start_location geography(Point), destination geography(Point),  ts timestamptz,  start_time timestamptz, end_time timestamptz)
+returns int
+language plpgsql
+as
+$$
+begin
+	return 0;
+end
+$$;
+
+select  1 = 1;
 	
+select
+ create_ride('customer',
+       	     'driver',
+	     ST_GeometryFromText('Point(-118.4079 33.9434)'),
+	     ST_GeometryFromText('Point(-118.4079 33.9434)'),
+	     now(),
+	     now(),
+	     now(),
+	     2);
 #+end_src
 
+#+RESULTS:
+| CREATE FUNCTION |
+|-----------------|
+| ?column?        |
+| t               |
+| create_ride     |
+| 0               |
 
+
+* Tasks
+
+** TODO Create a function to request a ride
+This should be somewhat smart, because we're bringing logic and
+validation into the database (after all, our objective is having an
+almost production level thing).
+
+1. *customer* and *driver* parameters should be checked; they should both
+   - Exist in the _users_ table
+   - Be either part of the *customer* or *driver* role
+
+2. *start_time* should be before *end_time*
+
+** TODO " set up driver_location
+** TODO " Start a ride (insert in ride without ride.end_time)
+** TODO " Finish ride  (update existing ride with ride.end_time)
 
 * Diary :noexport:
 
@@ -419,17 +461,16 @@ CREATE FUNCTION create_ride(text, text, geography(Point), geography(Point), time
       - driver goes to ride location
       - driver goes to destination
   - driver finishes ride (adds *end_time* to ride.end_time)
-- refuse ride path
+  - refuse ride path
   - customer requests ride (insert in ride_request)
   - Denying means nothing happens, the requests just hangs there at
     ride_request
+  - *UP NEXT*
 
-- *UP NEXT*
+    With most tables set up, we can start giving rides.
 
-  With most tables set up, we can start giving rides.
-
-  - *TODO* Create a function to request a ride (insert in ride_request)
-  - *TODO* " set up driver_location
-  - *TODO* " start a ride (insert in ride without ride.end_time)
-  - *TODO* " finish ride  (update existing ride with ride.end_time)
+    - *TODO* Create a function to request a ride (insert in ride_request)
+    - *TODO* " set up driver_location
+    - *TODO* " start a ride (insert in ride without ride.end_time)
+    - *TODO* " finish ride  (update existing ride with ride.end_time)
 
